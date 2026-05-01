@@ -18,6 +18,7 @@
 #include <exception>
 #include <memory>
 #include <filesystem>
+#include <unordered_map>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -168,6 +169,16 @@ struct server_slot {
     bool has_draft_backup = false;
     int  n_tokens_before_draft = 0; // prompt token count before draft tokens were added
 
+    // DFlash adaptive policy: rolling acceptance / cycle-time tracking
+    static constexpr int    DFLASH_ROLLING_WINDOW = 8;
+    static constexpr float  DFLASH_ACCEPTANCE_THRESHOLD = 0.25f;
+    static constexpr float  DFLASH_AR_TPS_ESTIMATE = 31.4f; // Vulkan AR baseline
+    static constexpr int    DFLASH_DISABLE_COOLDOWN = 32;
+    float                   dflash_rolling_acc_sum = 0.0f;
+    int                     dflash_rolling_acc_count = 0;
+    int                     dflash_disable_remain = 0; // tokens remaining in AR fallback
+    int64_t                 dflash_last_cycle_us = 0;
+
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
@@ -192,6 +203,12 @@ struct server_slot {
         n_draft_accepted = 0;
         has_draft_backup = false;
         n_tokens_before_draft = 0;
+
+        // reset DFlash adaptive state
+        dflash_rolling_acc_sum = 0.0f;
+        dflash_rolling_acc_count = 0;
+        dflash_disable_remain = 0;
+        dflash_last_cycle_us = 0;
 
         task_prev = std::move(task);
         task.reset();
@@ -284,6 +301,11 @@ struct server_slot {
             return 0;
         }
 
+        // DFlash adaptive fallback: if disabled by low acceptance, force AR path
+        if (dflash_disable_remain > 0) {
+            return 0;
+        }
+
         // determine the max draft that fits the current slot state
         int n_draft_max = task->params.speculative.n_max;
 
@@ -303,6 +325,45 @@ struct server_slot {
         }
 
         return n_draft_max;
+    }
+
+    // Update rolling acceptance after a speculative cycle.
+    // Returns true if DFlash should continue, false if AR fallback is better.
+    bool dflash_update_policy(int n_accepted_this_cycle, int n_proposed_this_cycle, int64_t cycle_us) {
+        if (n_proposed_this_cycle > 0) {
+            float acc = (float) n_accepted_this_cycle / n_proposed_this_cycle;
+            // Exponential moving average for rolling acceptance
+            const float alpha = 0.3f;
+            if (dflash_rolling_acc_count == 0) {
+                dflash_rolling_acc_sum = acc;
+            } else {
+                dflash_rolling_acc_sum = alpha * acc + (1.0f - alpha) * dflash_rolling_acc_sum;
+            }
+            dflash_rolling_acc_count = std::min(dflash_rolling_acc_count + 1, DFLASH_ROLLING_WINDOW);
+        }
+        dflash_last_cycle_us = cycle_us;
+
+        float rolling_acc = (dflash_rolling_acc_count > 0) ? dflash_rolling_acc_sum : 1.0f;
+
+        // Expected DFlash TPS = accepted_per_cycle / cycle_time
+        float cycle_s = cycle_us / 1e6f;
+        float expected_tps = (cycle_s > 0.0f && n_proposed_this_cycle > 0)
+            ? (n_proposed_this_cycle * rolling_acc / cycle_s)
+            : DFLASH_AR_TPS_ESTIMATE;
+
+        bool should_use = expected_tps > DFLASH_AR_TPS_ESTIMATE * 1.10f;
+
+        if (!should_use && dflash_disable_remain == 0) {
+            dflash_disable_remain = DFLASH_DISABLE_COOLDOWN;
+            SLT_INF(*this, "DFlash auto-disable: expected=%.1f tps < AR=%.1f tps (acc=%.2f%%)\n",
+                    expected_tps, DFLASH_AR_TPS_ESTIMATE, rolling_acc * 100.0f);
+        }
+
+        if (dflash_disable_remain > 0) {
+            dflash_disable_remain--;
+        }
+
+        return should_use;
     }
 
     void release() {
@@ -2317,15 +2378,20 @@ private:
 
                     if (needs_reeval) {
                         // DFlash: sync previous tape replay, set linear parent IDs for tree kernel
+                        // Skip tree path for very small batches (overhead > benefit)
                         if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
                             llama_tape_replay_sync(ctx);
                             const int n_batch_tokens = 1 + (int) draft.size();
-                            std::vector<int32_t> linear_parents(n_batch_tokens);
-                            linear_parents[0] = -1; // root loads initial state
-                            for (int i = 1; i < n_batch_tokens; i++) {
-                                linear_parents[i] = i - 1;
+                            if (n_batch_tokens > 2) {
+                                std::vector<int32_t> linear_parents(n_batch_tokens);
+                                linear_parents[0] = -1; // root loads initial state
+                                for (int i = 1; i < n_batch_tokens; i++) {
+                                    linear_parents[i] = i - 1;
+                                }
+                                llama_set_tree_parent_ids(ctx, linear_parents.data(), n_batch_tokens);
+                            } else {
+                                llama_clear_tree_parent_ids(ctx);
                             }
-                            llama_set_tree_parent_ids(ctx, linear_parents.data(), n_batch_tokens);
                         }
 
                         if (!recurrent_expanded) {
@@ -2980,6 +3046,10 @@ private:
             llama_set_force_split_seq(ctx, false);
         }
 
+        // Per-slot stats for adaptive policy
+        struct slot_cycle_stat { int n_proposed = 0; int n_accepted = 0; };
+        std::unordered_map<int, slot_cycle_stat> cycle_stats;
+
         // process the created batch of tokens
         for (int32_t i = 0; i < batch.n_tokens; i = i_next) {
             const int32_t n_tokens = std::min(n_batch, batch.n_tokens - i);
@@ -3219,6 +3289,9 @@ private:
                     common_speculative_update_logits(slot.spec, ctx, batch_tokens, (int) ids.size());
                 }
 
+                // Save stats before clearing
+                cycle_stats[slot.id] = { (int) n_draft, (int) (ids.size() - 1) };
+
                 slot.i_batch_dft.clear();
                 slot.drafted.clear();
 
@@ -3322,6 +3395,16 @@ private:
                     n_slots_drafted,
                     t_draft_total / 1e3, t_verify_total / 1e3, t_accept_total / 1e3,
                     t_other / 1e3, t_cycle_total / 1e3);
+
+            // Update adaptive DFlash policy per slot
+            if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                for (auto & slot : slots) {
+                    auto it = cycle_stats.find(slot.id);
+                    if (it != cycle_stats.end() && it->second.n_proposed > 0) {
+                        slot.dflash_update_policy(it->second.n_accepted, it->second.n_proposed, t_cycle_total);
+                    }
+                }
+            }
         }
 
         // turn off DFlash tape recording after all sub-batches — was turned on

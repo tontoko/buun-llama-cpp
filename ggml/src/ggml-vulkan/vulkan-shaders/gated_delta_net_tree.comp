@@ -2,6 +2,7 @@
 
 #extension GL_EXT_control_flow_attributes : require
 #extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
 #if USE_SUBGROUP_CLUSTERED
 #extension GL_KHR_shader_subgroup_clustered : enable
 #endif
@@ -32,6 +33,7 @@ layout(push_constant) uniform Parameters {
     uint sb1, sb2, sb3;
     uint neq1, rq3;
     float scale;
+    uint persist_mask;
 };
 
 layout(binding = 0) readonly  buffer QBuf     { FLOAT_TYPE data_q[];     };
@@ -113,7 +115,11 @@ void main() {
     for (uint t = 0; t < n_tokens; t++) {
         // Tree branching: reload state from parent's intermediate if needed
         if (t > 0) {
-            int parent_t = data_parent_ids[t];
+            int parent_t_lane = 0;
+            if (gl_SubgroupInvocationID == 0) {
+                parent_t_lane = data_parent_ids[t];
+            }
+            int parent_t = subgroupBroadcastFirst(parent_t_lane);
             if (parent_t == -1) {
                 // Reload initial state (root token)
                 [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
@@ -199,13 +205,18 @@ void main() {
         // Selective persist: store intermediate state only if a future token
         // non-sequentially references this token as its parent.
         bool need_persist_local = false;
-        if (n_tokens > 1) {
-            for (uint u = t + 2; u < n_tokens; ++u) {
-                if (data_parent_ids[u] == int(t)) {
-                    need_persist_local = true;
-                    break;
+        if (persist_mask != 0u) {
+            need_persist_local = ((persist_mask >> t) & 1u) != 0u;
+        } else if (n_tokens > 1) {
+            if (gl_SubgroupInvocationID == 0) {
+                for (uint u = t + 2; u < n_tokens; ++u) {
+                    if (data_parent_ids[u] == int(t)) {
+                        need_persist_local = true;
+                        break;
+                    }
                 }
             }
+            need_persist_local = subgroupBroadcastFirst(need_persist_local);
         }
         if (need_persist_local) {
             uint inter_off = (seq_id * n_tokens + t) * inter_stride_token + head_id * state_size;

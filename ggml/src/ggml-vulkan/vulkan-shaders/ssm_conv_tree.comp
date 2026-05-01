@@ -24,7 +24,7 @@ layout(push_constant) uniform PushConstants {
 shared int slot_window[9];
 
 float silu(float x) {
-    return x / (1.0 + exp(-x));
+    return x / (1.0 + exp2(-x * 1.442695041f));
 }
 
 void main() {

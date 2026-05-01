@@ -1484,6 +1484,7 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t sb1, sb2, sb3;
     uint32_t neq1, rq3;
     float scale;
+    uint32_t persist_mask;
 };
 
 struct vk_op_ssm_scan_push_constants {
@@ -10580,7 +10581,8 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
         sv1, sv2, sv3,
         sb1, sb2, sb3,
         neq1, rq3,
-        scale
+        scale,
+        0
     };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
@@ -10633,7 +10635,8 @@ static void ggml_vk_gated_delta_net_tree(ggml_backend_vk_context * ctx, vk_conte
         sv1, sv2, sv3,
         sb1, sb2, sb3,
         neq1, rq3,
-        scale
+        scale,
+        0
     };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
