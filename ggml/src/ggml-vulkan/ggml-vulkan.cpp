@@ -4682,6 +4682,16 @@ static void ggml_vk_load_shaders(vk_device& device) {
                 lanes_per_column = std::min(S_V, device->subgroup_size);
             }
 
+            {
+                const char * env_lanes = getenv("GGML_VK_GDN_TREE_LANES");
+                if (env_lanes != nullptr) {
+                    int val = atoi(env_lanes);
+                    if (val > 0 && is_pow2((uint32_t)val) && (uint32_t)val <= device->subgroup_size && (S_V % (uint32_t)val) == 0) {
+                        lanes_per_column = (uint32_t)val;
+                    }
+                }
+            }
+
             const bool need_clustered_shader = lanes_per_column != 1 && (lanes_per_column < device->subgroup_size);
             size_t gdn_tree_len;
             const void * gdn_tree_data;

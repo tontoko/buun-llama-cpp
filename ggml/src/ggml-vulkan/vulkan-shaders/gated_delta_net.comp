@@ -118,43 +118,61 @@ void main() {
         const FLOAT_TYPE beta_val = FLOAT_TYPE(data_beta[gb_off]);
 
         FLOAT_TYPE k_reg[ROWS_PER_LANE];
-        FLOAT_TYPE q_reg[ROWS_PER_LANE];
         [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
             const uint i = r * LANES_PER_COLUMN + lane;
             k_reg[r] = FLOAT_TYPE(data_k[k_off + i]);
-            q_reg[r] = FLOAT_TYPE(data_q[q_off + i]);
         }
 
-        FLOAT_TYPE g_exp[ROWS_PER_LANE];
+        const FLOAT_TYPE v_val = FLOAT_TYPE(data_v[v_off + col]);
+
+        FLOAT_TYPE attn_col;
+
         if (KDA == 0) {
             const FLOAT_TYPE g_val = exp2(FLOAT_TYPE(data_g[gb_off]) * 1.442695041f);
+
+            FLOAT_TYPE kv_shard = 0.0;
             [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
-                g_exp[r] = g_val;
+                kv_shard += s_shard[r] * k_reg[r];
             }
+            FLOAT_TYPE kv_col = reduce_partial(kv_shard);
+            FLOAT_TYPE delta_col = (v_val - g_val * kv_col) * beta_val;
+
+            FLOAT_TYPE attn_partial = 0.0;
+            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                s_shard[r] = g_val * s_shard[r] + k_reg[r] * delta_col;
+                const uint i = r * LANES_PER_COLUMN + lane;
+                FLOAT_TYPE q_val = FLOAT_TYPE(data_q[q_off + i]);
+                attn_partial += s_shard[r] * q_val;
+            }
+            attn_col = reduce_partial(attn_partial);
         } else {
+            FLOAT_TYPE q_reg[ROWS_PER_LANE];
+            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                const uint i = r * LANES_PER_COLUMN + lane;
+                q_reg[r] = FLOAT_TYPE(data_q[q_off + i]);
+            }
+
+            FLOAT_TYPE g_exp[ROWS_PER_LANE];
             const uint g_base = gb_off * S_V;
             [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
                 const uint i = r * LANES_PER_COLUMN + lane;
                 g_exp[r] = exp2(FLOAT_TYPE(data_g[g_base + i]) * 1.442695041f);
             }
+
+            FLOAT_TYPE kv_shard = 0.0;
+            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                kv_shard += g_exp[r] * s_shard[r] * k_reg[r];
+            }
+            FLOAT_TYPE kv_col = reduce_partial(kv_shard);
+            FLOAT_TYPE delta_col = (v_val - kv_col) * beta_val;
+
+            FLOAT_TYPE attn_partial = 0.0;
+            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                s_shard[r] = g_exp[r] * s_shard[r] + k_reg[r] * delta_col;
+                attn_partial += s_shard[r] * q_reg[r];
+            }
+            attn_col = reduce_partial(attn_partial);
         }
-
-        const FLOAT_TYPE v_val = FLOAT_TYPE(data_v[v_off + col]);
-
-        FLOAT_TYPE kv_shard = 0.0;
-        [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
-            kv_shard += g_exp[r] * s_shard[r] * k_reg[r];
-        }
-        FLOAT_TYPE kv_col = reduce_partial(kv_shard);
-
-        FLOAT_TYPE delta_col = (v_val - kv_col) * beta_val;
-
-        FLOAT_TYPE attn_partial = 0.0;
-        [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
-            s_shard[r] = g_exp[r] * s_shard[r] + k_reg[r] * delta_col;
-            attn_partial += s_shard[r] * q_reg[r];
-        }
-        FLOAT_TYPE attn_col = reduce_partial(attn_partial);
 
         if (lane == 0) {
             data_dst[attn_off + col] = attn_col * scale;
