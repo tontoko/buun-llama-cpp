@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cstdlib>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -32,6 +33,58 @@
 using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+// DFlash runtime debug/investigation switches
+static inline bool dflash_env_force_off() {
+    static const bool val = [] {
+        const char * e = getenv("GGML_DFLASH_FORCE_OFF");
+        return e && atoi(e) != 0;
+    }();
+    return val;
+}
+static inline bool dflash_env_force_on() {
+    static const bool val = [] {
+        const char * e = getenv("GGML_DFLASH_FORCE_ON");
+        return e && atoi(e) != 0;
+    }();
+    return val;
+}
+static inline bool dflash_env_disable_adaptive() {
+    static const bool val = [] {
+        const char * e = getenv("GGML_DFLASH_DISABLE_ADAPTIVE");
+        return e && atoi(e) != 0;
+    }();
+    return val;
+}
+static inline int dflash_env_max_draft_override() {
+    static const int val = [] {
+        const char * e = getenv("GGML_DFLASH_MAX_DRAFT_OVERRIDE");
+        if (!e) return -1;
+        return std::max(0, atoi(e));
+    }();
+    return val;
+}
+static inline bool dflash_env_disable_tree_verify() {
+    static const bool val = [] {
+        const char * e = getenv("GGML_DFLASH_DISABLE_TREE_VERIFY");
+        return e && atoi(e) != 0;
+    }();
+    return val;
+}
+static inline bool dflash_env_log_top1() {
+    static const bool val = [] {
+        const char * e = getenv("GGML_DFLASH_LOG_TOP1");
+        return e && atoi(e) != 0;
+    }();
+    return val;
+}
+static inline bool dflash_env_log_cycle_breakdown() {
+    static const bool val = [] {
+        const char * e = getenv("GGML_DFLASH_LOG_CYCLE_BREAKDOWN");
+        return e && atoi(e) != 0;
+    }();
+    return val;
+}
 
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
 enum slot_state {
@@ -309,13 +362,24 @@ struct server_slot {
             return 0;
         }
 
+        // Env override: force DFlash off/on regardless of adaptive policy
+        if (dflash_env_force_off()) {
+            return 0;
+        }
+
+        const int max_override = dflash_env_max_draft_override();
+
+        if (dflash_env_force_on()) {
+            return max_override >= 0 ? max_override : task->params.speculative.n_max;
+        }
+
         // DFlash adaptive fallback: if disabled by low acceptance, force AR path
         if (dflash_disable_remain > 0) {
             return 0;
         }
 
         // determine the max draft that fits the current slot state
-        int n_draft_max = task->params.speculative.n_max;
+        int n_draft_max = max_override >= 0 ? max_override : task->params.speculative.n_max;
 
         // note: slot.prompt is not yet expanded with the `id` token sampled above
         //       also, need to leave space for 1 extra token to allow context shifts
@@ -359,7 +423,7 @@ struct server_slot {
             ? ((1 + n_accepted_this_cycle) / cycle_s)
             : 0.0f;
         float predicted_tps = (cycle_s > 0.0f && n_proposed_this_cycle > 0)
-            ? (n_proposed_this_cycle * rolling_acc / cycle_s)
+            ? ((1.0f + n_proposed_this_cycle * rolling_acc) / cycle_s)
             : 0.0f;
 
         float ar_tps = (dflash_ar_tps_ema > 0.0f) ? dflash_ar_tps_ema : DFLASH_AR_TPS_ESTIMATE_FALLBACK;
@@ -378,14 +442,14 @@ struct server_slot {
 
         // Extra guard: if draft dominates cycle time and expected TPS still loses to AR
         float total_ms = cycle_us / 1e3f;
-        if (draft_ms > total_ms * 0.70f && !should_use && dflash_disable_remain == 0) {
+        if (!dflash_env_disable_adaptive() && draft_ms > total_ms * 0.70f && !should_use && dflash_disable_remain == 0) {
             dflash_disable_remain = DFLASH_DISABLE_COOLDOWN * 2; // 64 tokens
             SLT_INF(*this, "DFlash auto-disable (draft-dominated): draft=%.1fms > 70%% of cycle, disabling for 64 tokens\n",
                     draft_ms);
         }
 
         // Standard disable
-        if (!should_use && dflash_disable_remain == 0) {
+        if (!dflash_env_disable_adaptive() && !should_use && dflash_disable_remain == 0) {
             dflash_disable_remain = DFLASH_DISABLE_COOLDOWN;
             SLT_INF(*this, "DFlash auto-disable: predicted=%.1f actual=%.1f tps < AR=%.1f tps (acc=%.2f%% draft=%.1f tok/s)\n",
                     predicted_tps, actual_tps, ar_tps, rolling_acc * 100.0f, draft_tok_per_s);
@@ -2327,9 +2391,14 @@ private:
         int64_t t_draft_total = 0;
         int64_t t_verify_total = 0;
         int64_t t_accept_total = 0;
+        int64_t t_pre_verify_total = 0;
+        int64_t t_accept_sampling_total = 0;
+        int64_t t_rollback_total = 0;
+        int64_t t_emit_total = 0;
         int n_slots_drafted = 0;
         std::unordered_map<int, int64_t> slot_draft_us;
         int64_t t_batch_draft_us = 0;
+        std::vector<int> batch_slot_ids;
 
         // DFlash: narrow the shared drafter graph when fewer than max slots are
         // actively drafting. When only 1 slot drafts, the graph builder uses
@@ -2354,7 +2423,7 @@ private:
             if (n_drafting >= 2 && params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
                 std::vector<common_speculative *> batch_specs;
                 std::vector<llama_token>          batch_id_lasts;
-                std::vector<int>                  batch_slot_ids;
+                batch_slot_ids.clear();
 
                 for (auto & slot : slots) {
                     if (slot.state == SLOT_STATE_GENERATING && slot.can_speculate() && slot.get_n_draft_max() > 0) {
@@ -2377,6 +2446,8 @@ private:
                 }
             }
         }
+
+        t_draft_total = 0;
 
         // first, add sampled tokens from any ongoing sequences
         for (auto & slot : slots) {
@@ -2402,7 +2473,7 @@ private:
                 llama_tokens draft;
                 if (was_batched) {
                     draft = std::move(batched_drafts[slot.id]);
-                    slot_draft_us[slot.id] = t_batch_draft_us;
+                    slot_draft_us[slot.id] = batch_slot_ids.empty() ? 0 : t_batch_draft_us / (int64_t)batch_slot_ids.size();
                 } else {
                     const int64_t t_draft_slot_start = ggml_time_us();
                     const llama_tokens & cached_text_tokens = slot.prompt.tokens.get_text_tokens();
@@ -2434,12 +2505,23 @@ private:
                     slot.n_draft_total += draft.size();
 
                     if (needs_reeval) {
+                        const int64_t t_pre_verify_start = ggml_time_us();
+                        int64_t t_tape_sync = 0;
+                        int64_t t_tree_setup = 0;
+                        int64_t t_recurrent_expand = 0;
+                        int64_t t_backup = 0;
                         // DFlash: sync previous tape replay, set linear parent IDs for tree kernel
                         // Skip tree path for very small batches (overhead > benefit)
                         if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                            int64_t t0 = ggml_time_us();
                             llama_tape_replay_sync(ctx);
+                            t_tape_sync = ggml_time_us() - t0;
+
+                            t0 = ggml_time_us();
                             const int n_batch_tokens = 1 + (int) draft.size();
-                            if (n_batch_tokens > 2) {
+                            if (dflash_env_disable_tree_verify()) {
+                                llama_clear_tree_parent_ids(ctx);
+                            } else if (n_batch_tokens > 2) {
                                 std::vector<int32_t> linear_parents(n_batch_tokens);
                                 linear_parents[0] = -1; // root loads initial state
                                 for (int i = 1; i < n_batch_tokens; i++) {
@@ -2449,9 +2531,11 @@ private:
                             } else {
                                 llama_clear_tree_parent_ids(ctx);
                             }
+                            t_tree_setup = ggml_time_us() - t0;
                         }
 
                         if (!recurrent_expanded) {
+                            int64_t t0 = ggml_time_us();
                             auto * mem = llama_get_memory(ctx);
                             if (llama_memory_recurrent_expand(mem, n_seq_max_full)) {
                                 SRV_INF("expanded recurrent state to %d cells for speculative backup\n", n_seq_max_full);
@@ -2459,12 +2543,21 @@ private:
                                 SRV_ERR("failed to expand recurrent state to %d cells\n", n_seq_max_full);
                             }
                             recurrent_expanded = true;
+                            t_recurrent_expand = ggml_time_us() - t0;
                         }
+                        int64_t t0 = ggml_time_us();
                         const llama_seq_id seq_backup = slot.id + n_parallel_user;
                         auto * mem = llama_get_memory(ctx);
                         llama_memory_seq_rm(mem, seq_backup, -1, -1);
                         llama_memory_seq_cp(mem, slot.id, seq_backup, -1, -1);
                         slot.has_draft_backup = true;
+                        t_backup = ggml_time_us() - t0;
+                        t_pre_verify_total += ggml_time_us() - t_pre_verify_start;
+
+                        if (dflash_env_log_cycle_breakdown()) {
+                            SLT_INF(slot, "pre_verify breakdown: tape_sync=%.1fms tree_setup=%.1fms recurrent_expand=%.1fms backup=%.1fms\n",
+                                    t_tape_sync / 1e3f, t_tree_setup / 1e3f, t_recurrent_expand / 1e3f, t_backup / 1e3f);
+                        }
                     }
 
                     // add all drafted tokens to the batch
@@ -2475,9 +2568,7 @@ private:
                     }
                     slot.drafted = std::move(draft);
                 }
-                if (!was_batched) {
-                    t_draft_total += slot_draft_us[slot.id];
-                }
+                t_draft_total += slot_draft_us[slot.id];
                 n_slots_drafted++;
             } else {
                 // no speculative decoding
@@ -3345,7 +3436,9 @@ private:
                 const size_t n_draft = slot.drafted.size();
 
                 // the accepted tokens from the speculation
+                const int64_t t_sample_start = ggml_time_us();
                 const auto ids = common_sampler_sample_and_accept_n(slot.smpl.get(), ctx, slot.i_batch_dft, slot.drafted);
+                t_accept_sampling_total += ggml_time_us() - t_sample_start;
 
                 // update DFlash hidden state ring + CopySpec prompt window with accepted tokens.
                 // Must run BEFORE rollback (matches speculative-simple ordering) and BEFORE clearing
@@ -3370,6 +3463,11 @@ private:
                     slot.dflash_first_token_total++;
                     if (slot.drafted[0] == ids[0]) {
                         slot.dflash_first_token_hits++;
+                    }
+                    if (dflash_env_log_top1()) {
+                        SLT_INF(slot, "DFlash top1: draft[0]=%d ids[0]=%d hit=%d n_draft=%zu\n",
+                                (int) slot.drafted[0], (int) ids[0],
+                                slot.drafted[0] == ids[0] ? 1 : 0, n_draft);
                     }
                 }
 
@@ -3398,6 +3496,7 @@ private:
                 slot.prompt.tokens.insert({ids.begin(), ids.end() - 1});
                 slot.sampled = ids.back(); // last accepted token
 
+                const int64_t t_rollback_start = ggml_time_us();
                 if (slot.has_draft_backup) {
                     const llama_seq_id seq_backup = slot.id + n_parallel_user;
                     const bool all_accepted = (ids.size() == n_draft + 1);
@@ -3446,7 +3545,9 @@ private:
                 } else {
                     llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
                 }
+                t_rollback_total += ggml_time_us() - t_rollback_start;
 
+                const int64_t t_emit_start = ggml_time_us();
                 for (size_t i = 0; i < ids.size(); ++i) {
                     completion_token_output result;
 
@@ -3465,6 +3566,7 @@ private:
                         break;
                     }
                 }
+                t_emit_total += ggml_time_us() - t_emit_start;
 
                 SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) ids.size() - 1, (int) n_draft, slot.prompt.n_tokens());
             }
@@ -3485,13 +3587,20 @@ private:
             float draft_tok_per_s = (t_draft_total > 0 && total_proposed > 0)
                 ? (total_proposed * 1e6f / t_draft_total)
                 : 0.0f;
-            float actual_tps = (t_cycle_total > 0) ? ((1 + total_accepted) * 1e6f / t_cycle_total) : 0.0f;
+            float actual_tps = (t_cycle_total > 0) ? ((cycle_stats.size() + total_accepted) * 1e6f / t_cycle_total) : 0.0f;
             float acceptance = (total_proposed > 0) ? (float)total_accepted / total_proposed : 0.0f;
             SRV_INF("spec cycle (%d slots): draft=%.1fms verify=%.1fms accept=%.1fms other=%.1fms total=%.1fms proposed=%d accepted=%d verify_tok=%d draft_tok/s=%.1f actual_tps=%.1f acceptance=%.3f\n",
                     n_slots_drafted,
                     t_draft_total / 1e3, t_verify_total / 1e3, t_accept_total / 1e3,
                     t_other / 1e3, t_cycle_total / 1e3,
                     total_proposed, total_accepted, total_verify_tokens, draft_tok_per_s, actual_tps, acceptance);
+
+            if (dflash_env_log_cycle_breakdown()) {
+                SRV_INF("spec cycle breakdown: pre_verify=%.1fms accept_sampling=%.1fms rollback=%.1fms emit=%.1fms unaccounted=%.1fms\n",
+                        t_pre_verify_total / 1e3, t_accept_sampling_total / 1e3,
+                        t_rollback_total / 1e3, t_emit_total / 1e3,
+                        (t_other - t_pre_verify_total) / 1e3);
+            }
 
             // Update adaptive DFlash policy per slot
             if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
