@@ -8,6 +8,7 @@
 #if USE_SUBGROUP_ADD
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #endif
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
 // Caller guarantees valid spec constants: S_V % COLS_PER_WG == 0 and S_V % LANES_PER_COLUMN == 0,
 // so no bounds checking is needed.
@@ -39,12 +40,13 @@ layout(binding = 2) readonly  buffer VBuf     { FLOAT_TYPE data_v[];     };
 layout(binding = 3) readonly  buffer GBuf     { FLOAT_TYPE data_g[];     };
 layout(binding = 4) readonly  buffer BetaBuf  { FLOAT_TYPE data_beta[];  };
 layout(binding = 5) readonly  buffer StateBuf { FLOAT_TYPE data_state[]; };
-layout(binding = 6)           buffer DstBuf   { FLOAT_TYPE data_dst[];   };
+layout(binding = 6) readonly  buffer ParentBuf{ int        data_parent_ids[]; };
+layout(binding = 7)           buffer InterBuf { float16_t  data_persist_inter[]; };
+layout(binding = 8)           buffer DstBuf   { FLOAT_TYPE data_dst[];   };
 
 #if !USE_SUBGROUP_ADD && !USE_SUBGROUP_CLUSTERED
 shared FLOAT_TYPE temp[SUBGROUP_SIZE];
 
-// This does a reduction across groups of LANES_PER_COLUMN
 FLOAT_TYPE reduce_add_shmem(FLOAT_TYPE partial) {
     const uint lane = gl_SubgroupInvocationID;
     temp[lane] = partial;
@@ -61,14 +63,11 @@ FLOAT_TYPE reduce_add_shmem(FLOAT_TYPE partial) {
 }
 #endif
 
-// clusterSize for subgroupClusteredAdd must be a compile-time constant; branch on spec constant
 FLOAT_TYPE reduce_partial(FLOAT_TYPE partial) {
     switch (LANES_PER_COLUMN) {
         case 1u:
             return partial;
 #if USE_SUBGROUP_CLUSTERED
-        // Workaround for GLSL requiring a literal constant for the cluster size.
-        // The branches should all fold away.
         case 2u:
             return subgroupClusteredAdd(partial, 2u);
         case 4u:
@@ -109,8 +108,27 @@ void main() {
     }
 
     uint attn_off = (seq_id * n_tokens * H + head_id) * S_V;
+    const uint inter_stride_token = H * state_size;
 
     for (uint t = 0; t < n_tokens; t++) {
+        // Tree branching: reload state from parent's intermediate if needed
+        if (t > 0) {
+            int parent_t = data_parent_ids[t];
+            if (parent_t == -1) {
+                // Reload initial state (root token)
+                [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                    s_shard[r] = FLOAT_TYPE(data_state[state_base + col * S_V + r * LANES_PER_COLUMN + lane]);
+                }
+            } else if (uint(parent_t) != t - 1) {
+                // Branch transition: load from parent's intermediate (f16 -> f32)
+                uint parent_inter_off = (seq_id * n_tokens + uint(parent_t)) * inter_stride_token + head_id * state_size;
+                [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                    s_shard[r] = FLOAT_TYPE(data_persist_inter[parent_inter_off + col * S_V + r * LANES_PER_COLUMN + lane]);
+                }
+            }
+            // else parent_t == t-1: sequential, state in registers is correct
+        }
+
         const uint q_off = iq3 * sq3 + t * sq2 + iq1 * sq1;
         const uint k_off = q_off;
         const uint v_off = seq_id * sv3 + t * sv2 + head_id * sv1;
@@ -178,9 +196,29 @@ void main() {
             data_dst[attn_off + col] = attn_col * scale;
         }
 
+        // Selective persist: store intermediate state only if a future token
+        // non-sequentially references this token as its parent.
+        bool need_persist_local = false;
+        if (n_tokens > 1) {
+            for (uint u = t + 2; u < n_tokens; ++u) {
+                if (data_parent_ids[u] == int(t)) {
+                    need_persist_local = true;
+                    break;
+                }
+            }
+        }
+        if (need_persist_local) {
+            uint inter_off = (seq_id * n_tokens + t) * inter_stride_token + head_id * state_size;
+            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                const uint i = r * LANES_PER_COLUMN + lane;
+                data_persist_inter[inter_off + col * S_V + i] = float16_t(s_shard[r]);
+            }
+        }
+
         attn_off += S_V * H;
     }
 
+    // Write final state (state after last token in DFS order)
     [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
         data_dst[s_off + state_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
     }
