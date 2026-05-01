@@ -227,6 +227,7 @@ struct server_slot {
     static constexpr float  DFLASH_ACCEPTANCE_THRESHOLD = 0.25f;
     static constexpr float  DFLASH_AR_TPS_ESTIMATE_FALLBACK = 31.4f; // fallback until EMA warms up
     static constexpr int    DFLASH_DISABLE_COOLDOWN = 32;
+    static constexpr int    DFLASH_MIN_POLICY_CYCLES = 2;
     float                   dflash_rolling_acc_sum = 0.0f;
     int                     dflash_rolling_acc_count = 0;
     int                     dflash_disable_remain = 0; // tokens remaining in AR fallback
@@ -362,23 +363,17 @@ struct server_slot {
             return 0;
         }
 
-        // Env override: force DFlash off/on regardless of adaptive policy
+        const bool force_on = dflash_env_force_on();
         if (dflash_env_force_off()) {
             return 0;
         }
 
         const int max_override = dflash_env_max_draft_override();
 
-        if (dflash_env_force_on()) {
-            return max_override >= 0 ? max_override : task->params.speculative.n_max;
-        }
-
-        // DFlash adaptive fallback: if disabled by low acceptance, force AR path
-        if (dflash_disable_remain > 0) {
+        if (!force_on && dflash_disable_remain > 0) {
             return 0;
         }
 
-        // determine the max draft that fits the current slot state
         int n_draft_max = max_override >= 0 ? max_override : task->params.speculative.n_max;
 
         // note: slot.prompt is not yet expanded with the `id` token sampled above
@@ -414,6 +409,10 @@ struct server_slot {
             dflash_rolling_acc_count = std::min(dflash_rolling_acc_count + 1, DFLASH_ROLLING_WINDOW);
         }
         dflash_last_cycle_us = cycle_us;
+
+        if (dflash_rolling_acc_count <= DFLASH_MIN_POLICY_CYCLES) {
+            return true; // log/track only, do not disable
+        }
 
         float rolling_acc = (dflash_rolling_acc_count > 0) ? dflash_rolling_acc_sum : 1.0f;
 
@@ -2400,6 +2399,10 @@ private:
         int64_t t_batch_draft_us = 0;
         std::vector<int> batch_slot_ids;
 
+        // Per-slot stats for adaptive policy
+        struct slot_cycle_stat { int n_proposed = 0; int n_accepted = 0; int64_t draft_us = 0; int64_t t_recurrent_expand = 0; };
+        std::unordered_map<int, slot_cycle_stat> cycle_stats;
+
         // DFlash: narrow the shared drafter graph when fewer than max slots are
         // actively drafting. When only 1 slot drafts, the graph builder uses
         // dynamic bucketing (~128-256 ctx_len) instead of the fixed n_slots×512
@@ -2557,6 +2560,9 @@ private:
                         if (dflash_env_log_cycle_breakdown()) {
                             SLT_INF(slot, "pre_verify breakdown: tape_sync=%.1fms tree_setup=%.1fms recurrent_expand=%.1fms backup=%.1fms\n",
                                     t_tape_sync / 1e3f, t_tree_setup / 1e3f, t_recurrent_expand / 1e3f, t_backup / 1e3f);
+                        }
+                        if (t_recurrent_expand > 0) {
+                            cycle_stats[slot.id].t_recurrent_expand = t_recurrent_expand;
                         }
                     }
 
@@ -3196,10 +3202,6 @@ private:
             llama_set_force_split_seq(ctx, false);
         }
 
-        // Per-slot stats for adaptive policy
-        struct slot_cycle_stat { int n_proposed = 0; int n_accepted = 0; int64_t draft_us = 0; };
-        std::unordered_map<int, slot_cycle_stat> cycle_stats;
-
         // process the created batch of tokens
         for (int32_t i = 0; i < batch.n_tokens; i = i_next) {
             const int32_t n_tokens = std::min(n_batch, batch.n_tokens - i);
@@ -3456,7 +3458,11 @@ private:
                 // Save stats before clearing
                 auto it_draft = slot_draft_us.find(slot.id);
                 int64_t draft_us = (it_draft != slot_draft_us.end()) ? it_draft->second : 0;
-                cycle_stats[slot.id] = { (int) n_draft, (int) (ids.size() - 1), draft_us };
+                auto & stat = cycle_stats[slot.id];
+                stat.n_proposed = (int) n_draft;
+                stat.n_accepted = (int) (ids.size() - 1);
+                stat.draft_us = draft_us;
+                // stat.t_recurrent_expand is preserved if set earlier
 
                 // Track first-token hit rate for temp=0 parity analysis
                 if (n_draft > 0) {
@@ -3607,8 +3613,13 @@ private:
                 for (auto & slot : slots) {
                     auto it = cycle_stats.find(slot.id);
                     if (it != cycle_stats.end() && it->second.n_proposed > 0) {
-                        slot.dflash_update_policy(it->second.n_accepted, it->second.n_proposed, t_cycle_total,
-                                                  it->second.draft_us / 1e3f, (float)t_verify_total);
+                        bool one_time_setup_cycle = it->second.t_recurrent_expand > 0;
+                        if (!one_time_setup_cycle) {
+                            slot.dflash_update_policy(it->second.n_accepted, it->second.n_proposed, t_cycle_total,
+                                                      it->second.draft_us / 1e3f, (float)t_verify_total);
+                        } else {
+                            SLT_INF(slot, "DFlash adaptive: skip policy update due to one-time recurrent_expand=%.1fms\n", it->second.t_recurrent_expand / 1e3f);
+                        }
                     }
                 }
             }
