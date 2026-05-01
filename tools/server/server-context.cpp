@@ -172,12 +172,16 @@ struct server_slot {
     // DFlash adaptive policy: rolling acceptance / cycle-time tracking
     static constexpr int    DFLASH_ROLLING_WINDOW = 8;
     static constexpr float  DFLASH_ACCEPTANCE_THRESHOLD = 0.25f;
-    static constexpr float  DFLASH_AR_TPS_ESTIMATE = 31.4f; // Vulkan AR baseline
+    static constexpr float  DFLASH_AR_TPS_ESTIMATE_FALLBACK = 31.4f; // fallback until EMA warms up
     static constexpr int    DFLASH_DISABLE_COOLDOWN = 32;
     float                   dflash_rolling_acc_sum = 0.0f;
     int                     dflash_rolling_acc_count = 0;
     int                     dflash_disable_remain = 0; // tokens remaining in AR fallback
     int64_t                 dflash_last_cycle_us = 0;
+    float                   dflash_ar_tps_ema = 0.0f;  // runtime AR TPS measured during fallback
+    int64_t                 dflash_t_last_ar_token_us = 0;
+    int                     dflash_first_token_hits = 0;
+    int                     dflash_first_token_total = 0;
 
     void reset() {
         SLT_DBG(*this, "%s", "\n");
@@ -204,11 +208,15 @@ struct server_slot {
         has_draft_backup = false;
         n_tokens_before_draft = 0;
 
-        // reset DFlash adaptive state
+        // reset DFlash adaptive state (per-request)
         dflash_rolling_acc_sum = 0.0f;
         dflash_rolling_acc_count = 0;
         dflash_disable_remain = 0;
         dflash_last_cycle_us = 0;
+        dflash_t_last_ar_token_us = 0;
+        dflash_first_token_hits = 0;
+        dflash_first_token_total = 0;
+        // dflash_ar_tps_ema is intentionally kept across requests
 
         task_prev = std::move(task);
         task.reset();
@@ -329,7 +337,7 @@ struct server_slot {
 
     // Update rolling acceptance after a speculative cycle.
     // Returns true if DFlash should continue, false if AR fallback is better.
-    bool dflash_update_policy(int n_accepted_this_cycle, int n_proposed_this_cycle, int64_t cycle_us) {
+    bool dflash_update_policy(int n_accepted_this_cycle, int n_proposed_this_cycle, int64_t cycle_us, float draft_ms, float /*verify_ms*/) {
         if (n_proposed_this_cycle > 0) {
             float acc = (float) n_accepted_this_cycle / n_proposed_this_cycle;
             // Exponential moving average for rolling acceptance
@@ -347,23 +355,58 @@ struct server_slot {
 
         // Expected DFlash TPS = accepted_per_cycle / cycle_time
         float cycle_s = cycle_us / 1e6f;
-        float expected_tps = (cycle_s > 0.0f && n_proposed_this_cycle > 0)
+        float actual_tps = (cycle_s > 0.0f && n_accepted_this_cycle >= 0)
+            ? ((1 + n_accepted_this_cycle) / cycle_s)
+            : 0.0f;
+        float predicted_tps = (cycle_s > 0.0f && n_proposed_this_cycle > 0)
             ? (n_proposed_this_cycle * rolling_acc / cycle_s)
-            : DFLASH_AR_TPS_ESTIMATE;
+            : 0.0f;
 
-        bool should_use = expected_tps > DFLASH_AR_TPS_ESTIMATE * 1.10f;
+        float ar_tps = (dflash_ar_tps_ema > 0.0f) ? dflash_ar_tps_ema : DFLASH_AR_TPS_ESTIMATE_FALLBACK;
 
-        if (!should_use && dflash_disable_remain == 0) {
-            dflash_disable_remain = DFLASH_DISABLE_COOLDOWN;
-            SLT_INF(*this, "DFlash auto-disable: expected=%.1f tps < AR=%.1f tps (acc=%.2f%%)\n",
-                    expected_tps, DFLASH_AR_TPS_ESTIMATE, rolling_acc * 100.0f);
+        bool should_use = predicted_tps > ar_tps * 1.10f;
+
+        // Extra guard: if draft generation itself is slower than AR, disable
+        float draft_tok_per_s = (draft_ms > 0.0f && n_proposed_this_cycle > 0)
+            ? (n_proposed_this_cycle / (draft_ms / 1e3f))
+            : 0.0f;
+        if (draft_tok_per_s > 0.0f && draft_tok_per_s < ar_tps && should_use) {
+            should_use = false;
+            SLT_INF(*this, "DFlash auto-disable: draft_tok_per_s=%.1f < ar_tps=%.1f\n",
+                    draft_tok_per_s, ar_tps);
         }
 
-        if (dflash_disable_remain > 0) {
-            dflash_disable_remain--;
+        // Extra guard: if draft dominates cycle time and expected TPS still loses to AR
+        float total_ms = cycle_us / 1e3f;
+        if (draft_ms > total_ms * 0.70f && !should_use && dflash_disable_remain == 0) {
+            dflash_disable_remain = DFLASH_DISABLE_COOLDOWN * 2; // 64 tokens
+            SLT_INF(*this, "DFlash auto-disable (draft-dominated): draft=%.1fms > 70%% of cycle, disabling for 64 tokens\n",
+                    draft_ms);
+        }
+
+        // Standard disable
+        if (!should_use && dflash_disable_remain == 0) {
+            dflash_disable_remain = DFLASH_DISABLE_COOLDOWN;
+            SLT_INF(*this, "DFlash auto-disable: predicted=%.1f actual=%.1f tps < AR=%.1f tps (acc=%.2f%% draft=%.1f tok/s)\n",
+                    predicted_tps, actual_tps, ar_tps, rolling_acc * 100.0f, draft_tok_per_s);
         }
 
         return should_use;
+    }
+
+    // Call this every time we emit an AR fallback token to advance cooldown.
+    void on_ar_token_emitted() {
+        if (dflash_disable_remain > 0) {
+            dflash_disable_remain--;
+        }
+    }
+
+    // Update AR TPS EMA from measured fallback decode time.
+    void update_ar_tps_ema(int n_tokens, int64_t dt_us) {
+        if (dt_us <= 0 || n_tokens <= 0) return;
+        float tps = n_tokens / (dt_us / 1e6f);
+        const float alpha = 0.2f;
+        dflash_ar_tps_ema = (dflash_ar_tps_ema == 0.0f) ? tps : alpha * tps + (1.0f - alpha) * dflash_ar_tps_ema;
     }
 
     void release() {
@@ -463,6 +506,14 @@ struct server_slot {
             SLT_CNT(*this,
                     "draft acceptance rate = %0.5f (%5d accepted / %5d generated)\n",
                     draft_ratio, n_draft_accepted, n_draft_total
+            );
+        }
+
+        if (dflash_first_token_total > 0) {
+            SLT_CNT(*this,
+                    "DFlash first-token hit rate = %0.5f (%5d hits / %5d total)\n",
+                    (float) dflash_first_token_hits / dflash_first_token_total,
+                    dflash_first_token_hits, dflash_first_token_total
             );
         }
 
@@ -794,6 +845,8 @@ private:
                 SRV_INF("auto-detected DFlash drafter (block_size=%d)\n",
                         llama_model_dflash_block_size(model_dft.get()));
             }
+            SRV_INF("draft model loaded: %d layers, n_gpu_layers=%d\n",
+                    llama_model_n_layer(model_dft.get()), params_dft.n_gpu_layers);
 
             // DFlash drafter decodes up to MAX_SLOTS × block_size tokens per call
             // (batched multi-slot draft). Size drafter ubatch exactly for that so
@@ -2275,6 +2328,8 @@ private:
         int64_t t_verify_total = 0;
         int64_t t_accept_total = 0;
         int n_slots_drafted = 0;
+        std::unordered_map<int, int64_t> slot_draft_us;
+        int64_t t_batch_draft_us = 0;
 
         // DFlash: narrow the shared drafter graph when fewer than max slots are
         // actively drafting. When only 1 slot drafts, the graph builder uses
@@ -2315,6 +2370,7 @@ private:
                         batch_specs, ctx_dft_shared.get(),
                         params_base.speculative, batch_id_lasts, batch_results);
                 t_draft_total = ggml_time_us() - t_batch_start;
+                t_batch_draft_us = t_draft_total;
 
                 for (size_t i = 0; i < batch_slot_ids.size(); i++) {
                     batched_drafts[batch_slot_ids[i]] = std::move(batch_results[i]);
@@ -2338,20 +2394,21 @@ private:
             // generate draft tokens in speculative decoding mode
             const int n_draft_max = slot.get_n_draft_max();
             if (n_draft_max > 0) {
-                const int64_t t_draft_slot_start = ggml_time_us();
                 if (mctx) {
                     // we should never reach this, as speculative is automatically disabled if mmproj is loaded
                     GGML_ABORT("not supported by multimodal");
                 }
-
-                // use pre-computed batched draft if available, else single-slot
+                bool was_batched = !batched_drafts[slot.id].empty();
                 llama_tokens draft;
-                if (!batched_drafts[slot.id].empty()) {
+                if (was_batched) {
                     draft = std::move(batched_drafts[slot.id]);
+                    slot_draft_us[slot.id] = t_batch_draft_us;
                 } else {
+                    const int64_t t_draft_slot_start = ggml_time_us();
                     const llama_tokens & cached_text_tokens = slot.prompt.tokens.get_text_tokens();
                     const auto & params_spec = slot.task->params.speculative;
                     draft = common_speculative_draft(slot.spec, params_spec, cached_text_tokens, slot.sampled);
+                    slot_draft_us[slot.id] = ggml_time_us() - t_draft_slot_start;
                 }
 
                 if (draft.size() > (size_t) n_draft_max) {
@@ -2418,7 +2475,9 @@ private:
                     }
                     slot.drafted = std::move(draft);
                 }
-                t_draft_total += ggml_time_us() - t_draft_slot_start;
+                if (!was_batched) {
+                    t_draft_total += slot_draft_us[slot.id];
+                }
                 n_slots_drafted++;
             } else {
                 // no speculative decoding
@@ -3047,7 +3106,7 @@ private:
         }
 
         // Per-slot stats for adaptive policy
-        struct slot_cycle_stat { int n_proposed = 0; int n_accepted = 0; };
+        struct slot_cycle_stat { int n_proposed = 0; int n_accepted = 0; int64_t draft_us = 0; };
         std::unordered_map<int, slot_cycle_stat> cycle_stats;
 
         // process the created batch of tokens
@@ -3236,6 +3295,18 @@ private:
 
                 slot.n_decoded += 1;
 
+                // Advance DFlash cooldown on every AR token emitted.
+                // This fixes the bug where cooldown never decrements because
+                // dflash_update_policy is only called after speculative cycles.
+                slot.on_ar_token_emitted();
+
+                // Update AR TPS EMA during pure AR fallback (no draft this cycle).
+                // We measure time between consecutive AR tokens for this slot.
+                if (slot.dflash_t_last_ar_token_us > 0) {
+                    slot.update_ar_tps_ema(1, t_current - slot.dflash_t_last_ar_token_us);
+                }
+                slot.dflash_t_last_ar_token_us = t_current;
+
                 if (slot.n_decoded == 1) {
                     slot.t_start_generation = t_current;
                     slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
@@ -3290,7 +3361,17 @@ private:
                 }
 
                 // Save stats before clearing
-                cycle_stats[slot.id] = { (int) n_draft, (int) (ids.size() - 1) };
+                auto it_draft = slot_draft_us.find(slot.id);
+                int64_t draft_us = (it_draft != slot_draft_us.end()) ? it_draft->second : 0;
+                cycle_stats[slot.id] = { (int) n_draft, (int) (ids.size() - 1), draft_us };
+
+                // Track first-token hit rate for temp=0 parity analysis
+                if (n_draft > 0) {
+                    slot.dflash_first_token_total++;
+                    if (slot.drafted[0] == ids[0]) {
+                        slot.dflash_first_token_hits++;
+                    }
+                }
 
                 slot.i_batch_dft.clear();
                 slot.drafted.clear();
@@ -3298,6 +3379,9 @@ private:
                 const int64_t t_current = ggml_time_us();
 
                 slot.n_decoded += ids.size();
+
+                // Reset AR token timer so next AR measurement doesn't include spec cycle time
+                slot.dflash_t_last_ar_token_us = t_current;
 
                 slot.t_token_generation = std::max<int64_t>(1, t_current - slot.t_start_generation) / 1e3;
 
@@ -3391,17 +3475,31 @@ private:
         if (n_slots_drafted > 0) {
             const int64_t t_cycle_total = ggml_time_us() - t_cycle_start;
             const int64_t t_other = t_cycle_total - t_draft_total - t_verify_total - t_accept_total;
-            SRV_INF("spec cycle (%d slots): draft=%.1fms verify=%.1fms accept=%.1fms other=%.1fms total=%.1fms\n",
+            int total_proposed = 0;
+            int total_accepted = 0;
+            for (const auto & kv : cycle_stats) {
+                total_proposed += kv.second.n_proposed;
+                total_accepted += kv.second.n_accepted;
+            }
+            int total_verify_tokens = total_proposed + (int)cycle_stats.size();
+            float draft_tok_per_s = (t_draft_total > 0 && total_proposed > 0)
+                ? (total_proposed * 1e6f / t_draft_total)
+                : 0.0f;
+            float actual_tps = (t_cycle_total > 0) ? ((1 + total_accepted) * 1e6f / t_cycle_total) : 0.0f;
+            float acceptance = (total_proposed > 0) ? (float)total_accepted / total_proposed : 0.0f;
+            SRV_INF("spec cycle (%d slots): draft=%.1fms verify=%.1fms accept=%.1fms other=%.1fms total=%.1fms proposed=%d accepted=%d verify_tok=%d draft_tok/s=%.1f actual_tps=%.1f acceptance=%.3f\n",
                     n_slots_drafted,
                     t_draft_total / 1e3, t_verify_total / 1e3, t_accept_total / 1e3,
-                    t_other / 1e3, t_cycle_total / 1e3);
+                    t_other / 1e3, t_cycle_total / 1e3,
+                    total_proposed, total_accepted, total_verify_tokens, draft_tok_per_s, actual_tps, acceptance);
 
             // Update adaptive DFlash policy per slot
             if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
                 for (auto & slot : slots) {
                     auto it = cycle_stats.find(slot.id);
                     if (it != cycle_stats.end() && it->second.n_proposed > 0) {
-                        slot.dflash_update_policy(it->second.n_accepted, it->second.n_proposed, t_cycle_total);
+                        slot.dflash_update_policy(it->second.n_accepted, it->second.n_proposed, t_cycle_total,
+                                                  it->second.draft_us / 1e3f, (float)t_verify_total);
                     }
                 }
             }
