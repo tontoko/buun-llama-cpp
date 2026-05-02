@@ -2513,27 +2513,18 @@ private:
                         int64_t t_tree_setup = 0;
                         int64_t t_recurrent_expand = 0;
                         int64_t t_backup = 0;
-                        // DFlash: sync previous tape replay, set linear parent IDs for tree kernel
-                        // Skip tree path for very small batches (overhead > benefit)
+                        // DFlash: sync previous tape replay, clear tree parent IDs for linear draft path
+                        // TODO: when server starts producing real branch/tree drafts, pass actual parent_ids here;
+                        //       do not set parent_ids for linear drafts.
                         if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
                             int64_t t0 = ggml_time_us();
                             llama_tape_replay_sync(ctx);
                             t_tape_sync = ggml_time_us() - t0;
 
                             t0 = ggml_time_us();
-                            const int n_batch_tokens = 1 + (int) draft.size();
-                            if (dflash_env_disable_tree_verify()) {
-                                llama_clear_tree_parent_ids(ctx);
-                            } else if (n_batch_tokens > 2) {
-                                std::vector<int32_t> linear_parents(n_batch_tokens);
-                                linear_parents[0] = -1; // root loads initial state
-                                for (int i = 1; i < n_batch_tokens; i++) {
-                                    linear_parents[i] = i - 1;
-                                }
-                                llama_set_tree_parent_ids(ctx, linear_parents.data(), n_batch_tokens);
-                            } else {
-                                llama_clear_tree_parent_ids(ctx);
-                            }
+                            // Current server DFlash draft path is linear, not a branched tree.
+                            // Linear drafts should use the normal recurrent verify path; tree parent IDs are only needed for real branch/tree verification.
+                            llama_clear_tree_parent_ids(ctx);
                             t_tree_setup = ggml_time_us() - t0;
                         }
 
